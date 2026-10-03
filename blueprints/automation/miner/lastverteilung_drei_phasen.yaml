@@ -1,0 +1,258 @@
+# Version: 1.0.0
+# Home Assistant – Lastverteilung Drei-Phasen-Miner
+#
+# Regelt einen Miner anhand der Gesamtlast seiner zugeordneten Phase.
+# Ziel: maximal 9.000 W Phasenlast.
+#
+# Berechnung:
+# Grundlast = Phasenleistung - aktuelles Miner-Power-Target
+# verfügbar = Phasengrenzwert - Grundlast - Sicherheitsreserve
+#
+# Hinweis:
+# In v1.0.0 wird das aktuelle Miner-Power-Target als Mineranteil
+# an der Phasenleistung verwendet. Ein separater Ist-Leistungssensor
+# des Miners ist daher nicht erforderlich.
+
+blueprint:
+  name: "Miner – Lastverteilung Drei Phasen 9 kW"
+  description: >
+    Begrenzt die Gesamtlast der Phase, an der ein ausgewählter Miner hängt,
+    auf maximal 9.000 W. Überwacht Phase A, B und C, berechnet aus der
+    Phasenlast und dem aktuellen Miner-Power-Target die zulässige Minerleistung
+    und setzt das Power Target entsprechend. Prüfung standardmäßig alle
+    5 Minuten sowie sofort bei einer Phasenlast über 9.000 W.
+  domain: automation
+  source_url: "https://github.com/Nebukadneczar/Home-Assitant-Lastverteilung-Drei-Phasen-Miner"
+  input:
+
+    phase_a_sensor:
+      name: Phase A – Leistung
+      description: Sensor mit der aktuellen Leistung von Phase A in Watt.
+      selector:
+        entity:
+          domain: sensor
+          device_class: power
+
+    phase_b_sensor:
+      name: Phase B – Leistung
+      description: Sensor mit der aktuellen Leistung von Phase B in Watt.
+      selector:
+        entity:
+          domain: sensor
+          device_class: power
+
+    phase_c_sensor:
+      name: Phase C – Leistung
+      description: Sensor mit der aktuellen Leistung von Phase C in Watt.
+      selector:
+        entity:
+          domain: sensor
+          device_class: power
+
+    miner_phase:
+      name: Miner-Phase
+      description: Phase, an der der zu regelnde Miner angeschlossen ist.
+      default: B
+      selector:
+        select:
+          options:
+            - A
+            - B
+            - C
+
+    miner_power_target:
+      name: Miner Power Target
+      description: number.* Entity, über die das Leistungsziel des Miners gesetzt wird.
+      selector:
+        entity:
+          domain: number
+
+    max_miner_power:
+      name: Maximale Minerleistung
+      description: Obergrenze für das Power Target des Miners.
+      default: 2832
+      selector:
+        number:
+          min: 0
+          max: 15000
+          step: 1
+          mode: box
+          unit_of_measurement: W
+
+    phase_limit:
+      name: Phasengrenzwert
+      description: Maximale zulässige Leistung der überwachten Phase.
+      default: 9000
+      selector:
+        number:
+          min: 1000
+          max: 20000
+          step: 100
+          mode: box
+          unit_of_measurement: W
+
+    safety_margin:
+      name: Sicherheitsreserve
+      description: Reserve unterhalb des Phasengrenzwertes.
+      default: 100
+      selector:
+        number:
+          min: 0
+          max: 2000
+          step: 50
+          mode: box
+          unit_of_measurement: W
+
+    change_step:
+      name: Änderungsstufe
+      description: Power Target wird auf diese Schrittweite gerundet.
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 1000
+          step: 1
+          mode: box
+          unit_of_measurement: W
+
+    evaluation_interval:
+      name: Prüfintervall
+      description: Zeit zwischen normalen Prüfungen.
+      default: "/5"
+      selector:
+        select:
+          options:
+            - label: "1 Minute"
+              value: "/1"
+            - label: "5 Minuten"
+              value: "/5"
+            - label: "10 Minuten"
+              value: "/10"
+            - label: "15 Minuten"
+              value: "/15"
+
+    notification_id:
+      name: Benachrichtigungs-ID
+      description: ID für die persistente Home-Assistant-Benachrichtigung.
+      default: "miner_lastverteilung_drei_phasen"
+      selector:
+        text:
+
+mode: restart
+max_exceeded: silent
+
+trigger:
+  - platform: time_pattern
+    minutes: !input evaluation_interval
+    id: zyklus
+
+  - platform: state
+    entity_id: !input phase_a_sensor
+    id: phase_a_aenderung
+
+  - platform: state
+    entity_id: !input phase_b_sensor
+    id: phase_b_aenderung
+
+  - platform: state
+    entity_id: !input phase_c_sensor
+    id: phase_c_aenderung
+
+condition: []
+
+action:
+  - variables:
+      phase_a: !input phase_a_sensor
+      phase_b: !input phase_b_sensor
+      phase_c: !input phase_c_sensor
+      selected_phase: !input miner_phase
+      target_entity: !input miner_power_target
+      configured_max: !input max_miner_power
+      configured_limit: !input phase_limit
+      configured_margin: !input safety_margin
+      configured_step: !input change_step
+
+      phase_power: >-
+        {% if selected_phase == 'A' %}
+          {{ states(phase_a) | float(0) }}
+        {% elif selected_phase == 'B' %}
+          {{ states(phase_b) | float(0) }}
+        {% else %}
+          {{ states(phase_c) | float(0) }}
+        {% endif %}
+
+      current_target: "{{ states(target_entity) | float(0) }}"
+
+      base_load: >-
+        {{ [phase_power - current_target, 0] | max }}
+
+      available_power_raw: >-
+        {{ configured_limit - base_load - configured_margin }}
+
+      available_power: >-
+        {{ [available_power_raw, configured_max] | min | max(0) }}
+
+      rounded_power: >-
+        {{ ((available_power / configured_step) | round(0, 'floor')) * configured_step }}
+
+      new_target: >-
+        {{ [rounded_power, configured_max] | min | max(0) | int }}
+
+      over_limit: "{{ phase_power > configured_limit }}"
+
+      target_difference: >-
+        {{ (new_target - current_target) | abs }}
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ over_limit }}"
+        sequence:
+          - service: number.set_value
+            target:
+              entity_id: !input miner_power_target
+            data:
+              value: "{{ new_target }}"
+
+          - service: persistent_notification.create
+            data:
+              notification_id: !input notification_id
+              title: "Drei-Phasen-Lastverteilung"
+              message: >-
+                Phase {{ selected_phase }} über dem Grenzwert:
+                {{ phase_power | round(0) }} W.
+                Miner-Ziel auf {{ new_target }} W gesetzt.
+
+      - conditions:
+          - condition: template
+            value_template: "{{ target_difference >= configured_step }}"
+        sequence:
+          - service: number.set_value
+            target:
+              entity_id: !input miner_power_target
+            data:
+              value: "{{ new_target }}"
+
+          - service: persistent_notification.create
+            data:
+              notification_id: !input notification_id
+              title: "Drei-Phasen-Lastverteilung"
+              message: >-
+                Phase {{ selected_phase }}:
+                {{ phase_power | round(0) }} W Gesamtlast.
+                Miner-Ziel: {{ current_target | round(0) }} W →
+                {{ new_target }} W.
+
+      - conditions:
+          - condition: template
+            value_template: "{{ phase_power | float(0) >= configured_limit - configured_margin }}"
+        sequence:
+          - service: persistent_notification.create
+            data:
+              notification_id: !input notification_id
+              title: "Drei-Phasen-Lastverteilung"
+              message: >-
+                Phase {{ selected_phase }} nähert sich dem Grenzwert:
+                {{ phase_power | round(0) }} W von {{ configured_limit | round(0) }} W.
+
+    default: []
